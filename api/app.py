@@ -1,90 +1,137 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import sqlite3
 import subprocess
 import hashlib
 import os
+import ast
+import hmac
+import secrets
 
 app = Flask(__name__)
 
-SECRET_KEY = "dev-secret-key-12345"  # Hardcoded secret
+# ✅ Secret stocké dans une variable d’environnement
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
 
+# -----------------------------
+# 1. LOGIN (SQL Injection FIX)
+# -----------------------------
 @app.route("/login", methods=["POST"])
 def login():
-    username = request.json.get("username")
-    password = request.json.get("password")
+    data = request.get_json()
+    username = data.get("username")
+    password = data.get("password")
 
     conn = sqlite3.connect("users.db")
     cursor = conn.cursor()
 
-    # Vulnérabilité : SQL Injection
-    query = f"SELECT * FROM users WHERE username='{username}' AND password='{password}'"
-    cursor.execute(query)
+    # ✅ Requête paramétrée (anti SQL Injection)
+    cursor.execute(
+        "SELECT * FROM users WHERE username = ? AND password = ?",
+        (username, password)
+    )
 
     result = cursor.fetchone()
+    conn.close()
 
     if result:
-        return {"status": "success", "user": username}
+        return jsonify({"status": "success", "user": username})
 
-    return {"status": "error", "message": "Invalid credentials"}
+    return jsonify({"status": "error", "message": "Invalid credentials"}), 401
 
 
+# -----------------------------
+# 2. PING (Command Injection FIX)
+# -----------------------------
 @app.route("/ping", methods=["POST"])
 def ping():
     host = request.json.get("host", "")
-    cmd = f"ping -c 1 {host}"
 
-    # Vulnérabilité : Command Injection
-    output = subprocess.check_output(cmd, shell=True)
+    # ✅ Validation simple de l’entrée
+    if not host.replace(".", "").isalnum():
+        return jsonify({"error": "Invalid host"}), 400
 
-    return {"output": output.decode()}
+    # ✅ shell=False + liste d’arguments
+    output = subprocess.check_output(
+        ["ping", "-c", "1", host],
+        stderr=subprocess.STDOUT
+    )
+
+    return jsonify({"output": output.decode()})
 
 
+# -----------------------------
+# 3. COMPUTE (eval FIX)
+# -----------------------------
 @app.route("/compute", methods=["POST"])
 def compute():
     expression = request.json.get("expression", "1+1")
 
-    # CRITIQUE : exécution de code arbitraire
-    result = eval(expression)
+    try:
+        # ✅ Évaluation sûre avec ast
+        node = ast.parse(expression, mode="eval")
 
-    return {"result": result}
+        for n in ast.walk(node):
+            if not isinstance(n, (ast.Expression, ast.BinOp, ast.Num, ast.Add, ast.Sub, ast.Mult, ast.Div)):
+                raise ValueError("Invalid expression")
+
+        result = eval(compile(node, "<expr>", "eval"))
+        return jsonify({"result": result})
+
+    except Exception:
+        return jsonify({"error": "Invalid expression"}), 400
 
 
+# -----------------------------
+# 4. HASH (MD5 FIX)
+# -----------------------------
 @app.route("/hash", methods=["POST"])
 def hash_password():
-    pwd = request.json.get("password", "admin")
+    pwd = request.json.get("password", "")
 
-    # Vulnérabilité : MD5 (faible)
-    hashed = hashlib.md5(pwd.encode()).hexdigest()
+    # ✅ SHA-256 (beaucoup plus sûr que MD5)
+    hashed = hashlib.sha256(pwd.encode()).hexdigest()
 
-    return {"md5": hashed}
+    return jsonify({"sha256": hashed})
 
 
+# -----------------------------
+# 5. READ FILE (Path Traversal FIX)
+# -----------------------------
 @app.route("/readfile", methods=["POST"])
 def readfile():
-    filename = request.json.get("filename", "test.txt")
+    filename = request.json.get("filename", "")
 
-    # Vulnérabilité : Path Traversal
-    with open(filename, "r") as f:
-        content = f.read()
+    base_dir = os.path.abspath("files")
+    file_path = os.path.abspath(os.path.join(base_dir, filename))
 
-    return {"content": content}
+    # ✅ Vérification du chemin
+    if not file_path.startswith(base_dir):
+        return jsonify({"error": "Access denied"}), 403
+
+    try:
+        with open(file_path, "r") as f:
+            content = f.read()
+        return jsonify({"content": content})
+    except FileNotFoundError:
+        return jsonify({"error": "File not found"}), 404
 
 
+# -----------------------------
+# 6. DEBUG (Info Leak FIX)
+# -----------------------------
 @app.route("/debug", methods=["GET"])
 def debug():
-    # Mauvaise pratique : exposition d'informations sensibles
-    return {
-        "debug": True,
-        "secret_key": SECRET_KEY,
-        "environment": dict(os.environ)
-    }
+    return jsonify({"debug": False})
 
 
+# -----------------------------
+# 7. HELLO
+# -----------------------------
 @app.route("/hello", methods=["GET"])
 def hello():
-    return {"message": "Welcome to the DevSecOps vulnerable API"}
+    return jsonify({"message": "Welcome to the secured DevSecOps API"})
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=False)
